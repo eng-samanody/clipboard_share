@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
-import base64
 import copy
-import ipaddress
 import json
 import os
 import secrets
-import socket
-import ssl
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import bcrypt
-from cryptography import x509
 from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 
 
 HOST = "0.0.0.0"
@@ -28,10 +19,6 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_FILE = APP_DIR / "clipshare_vault.dat"
 LEGACY_TEXT_FILE = APP_DIR / "clipshare.txt"
 SECRETS_FILE = APP_DIR / "clipshare_secrets.json"
-BOOTSTRAP_FILE = APP_DIR / "clipshare_bootstrap.txt"
-TLS_CERT_FILE = APP_DIR / "clipshare_cert.pem"
-TLS_KEY_FILE = APP_DIR / "clipshare_key.pem"
-HISTORY_LIMIT = 12
 STATE_LOCK = threading.Lock()
 
 
@@ -104,14 +91,12 @@ HTML = """<!doctype html>
       gap: 0.75rem;
       flex-wrap: wrap;
     }}
-    .toolbar h2,
-    .history-head h2 {{
+    .toolbar h2 {{
       margin: 0;
       font-size: 1.1rem;
       letter-spacing: -0.03em;
     }}
-    .toolbar p,
-    .history-head p {{
+    .toolbar p {{
       margin: 0.25rem 0 0;
       color: var(--muted);
       font-size: 0.94rem;
@@ -208,21 +193,18 @@ HTML = """<!doctype html>
       outline: 2px solid rgba(189, 79, 38, 0.28);
       border-color: rgba(189, 79, 38, 0.35);
     }}
-    .entries-grid,
-    .history-list {{
+    .entries-grid {{
       display: grid;
       gap: 0.85rem;
       margin-top: 1rem;
     }}
-    .entry-actions,
-    .history-actions {{
+    .entry-actions {{
       display: flex;
       gap: 0.6rem;
       flex-wrap: wrap;
       justify-content: flex-end;
     }}
-    .entry-card,
-    .history-card {{
+    .entry-card {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 0.85rem;
@@ -232,8 +214,7 @@ HTML = """<!doctype html>
       background: var(--surface-strong);
       border: 1px solid var(--line);
     }}
-    .entry-label,
-    .history-label {{
+    .entry-label {{
       margin: 0 0 0.45rem;
       font-size: 0.8rem;
       letter-spacing: 0.08em;
@@ -275,8 +256,7 @@ HTML = """<!doctype html>
       box-shadow: 0 16px 28px rgba(75, 45, 17, 0.08);
       object-fit: contain;
     }}
-    .entry-meta,
-    .history-meta {{
+    .entry-meta {{
       margin: 0;
       color: var(--muted);
       font-size: 0.88rem;
@@ -330,14 +310,11 @@ HTML = """<!doctype html>
       .add-row {{
         grid-template-columns: 1fr;
       }}
-      .entry-card,
-      .history-card {{
+      .entry-card {{
         grid-template-columns: 1fr;
       }}
       .entry-actions,
-      .entry-actions > *,
-      .history-actions,
-      .history-actions > * {{
+      .entry-actions > * {{
         width: 100%;
       }}
       .status,
@@ -355,7 +332,7 @@ HTML = """<!doctype html>
         <div class="toolbar">
           <div>
             <h2>Entries</h2>
-            <p>Authenticated access, encrypted storage, serialized writes, and revision history are active.</p>
+            <p>Encrypted storage and serialized writes are active.</p>
           </div>
           <div class="toolbar-copy">
             <div class="security-note"><span class="pulse"></span> Secure Mode</div>
@@ -374,14 +351,6 @@ HTML = """<!doctype html>
         <input type="file" id="imageInput" accept="image/*" hidden>
         <div class="entries-grid" id="entriesList"></div>
       </section>
-
-      <section class="panel">
-        <div class="history-head">
-          <h2>Recent Versions</h2>
-          <p>Every mutation is stored as an encrypted revision snapshot. You can restore an earlier state if needed.</p>
-        </div>
-        <div class="history-list" id="historyList"></div>
-      </section>
     </div>
   </main>
 
@@ -394,13 +363,10 @@ HTML = """<!doctype html>
     const clearAllBtn = document.getElementById("clearAllBtn");
     const entriesStatus = document.getElementById("entriesStatus");
     const entriesList = document.getElementById("entriesList");
-    const historyList = document.getElementById("historyList");
 
     let currentState = {{
-      revision: 0,
       updated_at: "",
-      entries: [],
-      history: []
+      entries: []
     }};
 
     function setStatus(message, tone = "default") {{
@@ -621,67 +587,12 @@ HTML = """<!doctype html>
       }});
     }}
 
-    function renderHistory() {{
-      const history = currentState.history || [];
-      historyList.innerHTML = "";
-
-      if (!history.length) {{
-        const empty = document.createElement("div");
-        empty.className = "empty-state";
-        empty.textContent = "No revisions yet.";
-        historyList.appendChild(empty);
-        return;
-      }}
-
-      history.forEach((item) => {{
-        const card = document.createElement("article");
-        card.className = "history-card";
-
-        const content = document.createElement("div");
-
-        const label = document.createElement("p");
-        label.className = "history-label";
-        label.textContent = "Revision " + item.revision;
-
-        const meta = document.createElement("p");
-        meta.className = "history-meta";
-        meta.textContent = item.summary + " • " + item.entry_count + (item.entry_count === 1 ? " entry" : " entries") + " • " + formatTimestamp(item.updated_at);
-
-        content.appendChild(label);
-        content.appendChild(meta);
-
-        const actions = document.createElement("div");
-        actions.className = "history-actions";
-
-        if (item.revision !== currentState.revision) {{
-          const restoreBtn = document.createElement("button");
-          restoreBtn.type = "button";
-          restoreBtn.className = "ghost mini";
-          restoreBtn.textContent = "Restore";
-          restoreBtn.addEventListener("click", async () => {{
-            const confirmed = window.confirm("Restore revision " + item.revision + "? This creates a new revision.");
-            if (!confirmed) {{
-              return;
-            }}
-
-            await mutate("/api/restore", {{ revision: item.revision }}, "Restoring revision...");
-          }});
-          actions.appendChild(restoreBtn);
-        }}
-
-        card.appendChild(content);
-        card.appendChild(actions);
-        historyList.appendChild(card);
-      }});
-    }}
-
     function renderAll() {{
       renderEntries();
-      renderHistory();
       const count = currentState.entries.length;
       const suffix = count === 1 ? "entry" : "entries";
       const updated = currentState.updated_at ? " • " + formatTimestamp(currentState.updated_at) : "";
-      setStatus(count + " " + suffix + " • rev " + currentState.revision + updated, "default");
+      setStatus(count + " " + suffix + updated, "default");
     }}
 
     async function api(path, options = {{}}) {{
@@ -713,11 +624,11 @@ HTML = """<!doctype html>
       try {{
         const payload = await api("/api/state", {{ method: "GET" }});
         const nextState = payload.state;
-        const changed = nextState.revision !== currentState.revision;
+        const changed = nextState.updated_at !== currentState.updated_at;
         currentState = nextState;
         renderAll();
         if (changed && !silent) {{
-          setStatus("Synced revision " + currentState.revision, "success");
+          setStatus("Synced", "success");
         }}
       }} catch (error) {{
         setStatus(error.message, "active");
@@ -870,122 +781,14 @@ def secure_write_bytes(path: Path, value: bytes, mode: int = 0o600) -> None:
         pass
 
 
-def html_escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def build_auth_header() -> str:
-    return 'Basic realm="ClipShare", charset="UTF-8"'
-
-
-def parse_basic_auth(header: str | None) -> tuple[str | None, str | None]:
-    if not header or not header.startswith("Basic "):
-        return None, None
-
-    encoded = header.split(" ", 1)[1].strip()
-    try:
-        decoded = base64.b64decode(encoded).decode("utf-8")
-    except Exception:
-        return None, None
-
-    if ":" not in decoded:
-        return None, None
-
-    username, password = decoded.split(":", 1)
-    return username, password
-
-
-def local_addresses() -> tuple[list[str], list[str]]:
-    hostnames = {"localhost", socket.gethostname(), socket.getfqdn()}
-    ip_values = {"127.0.0.1", "::1"}
-
-    for host in list(hostnames):
-        if not host:
-            continue
-        try:
-            for family, _, _, _, sockaddr in socket.getaddrinfo(host, None):
-                if family in {socket.AF_INET, socket.AF_INET6}:
-                    ip_values.add(sockaddr[0])
-        except socket.gaierror:
-            continue
-
-    return sorted(name for name in hostnames if name), sorted(ip_values)
-
-
-def generate_self_signed_cert() -> None:
-    if TLS_CERT_FILE.exists() and TLS_KEY_FILE.exists():
-        return
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "ClipShare Local")]
-    )
-    hostnames, ip_values = local_addresses()
-    san_values: list[x509.GeneralName] = [x509.DNSName(name) for name in hostnames]
-
-    for value in ip_values:
-        try:
-            san_values.append(x509.IPAddress(ipaddress.ip_address(value)))
-        except ValueError:
-            continue
-
-    certificate = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365 * 2))
-        .add_extension(x509.SubjectAlternativeName(san_values), critical=False)
-        .sign(private_key, hashes.SHA256())
-    )
-
-    secure_write_bytes(
-        TLS_KEY_FILE,
-        private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ),
-        mode=0o600,
-    )
-    secure_write_bytes(
-        TLS_CERT_FILE,
-        certificate.public_bytes(serialization.Encoding.PEM),
-        mode=0o644,
-    )
-
-
 def ensure_secrets() -> dict[str, str]:
     if SECRETS_FILE.exists():
         return json.loads(SECRETS_FILE.read_text(encoding="utf-8"))
 
-    username = os.environ.get("CLIPSHARE_USERNAME", "clipshare")
-    password = os.environ.get("CLIPSHARE_PASSWORD") or secrets.token_urlsafe(18)
     secrets_payload = {
-        "username": username,
-        "password_hash": bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
         "fernet_key": Fernet.generate_key().decode("utf-8"),
     }
     secure_write_text(SECRETS_FILE, json.dumps(secrets_payload, indent=2))
-
-    if "CLIPSHARE_PASSWORD" not in os.environ:
-        secure_write_text(
-            BOOTSTRAP_FILE,
-            (
-                "ClipShare bootstrap credentials\n"
-                f"username: {username}\n"
-                f"password: {password}\n"
-                "Delete this file after copying the password somewhere safe.\n"
-            ),
-        )
-        print(f"Bootstrap credentials written to {BOOTSTRAP_FILE}")
-
     return secrets_payload
 
 
@@ -1010,25 +813,11 @@ def entry_from_legacy_line(line: str) -> dict[str, Any]:
     }
 
 
-def snapshot_for_state(state: dict[str, Any], summary: str) -> dict[str, Any]:
+def create_state(entries: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "revision": state["revision"],
-        "updated_at": state["updated_at"],
-        "entry_count": len(state["entries"]),
-        "summary": summary,
-        "entries": copy.deepcopy(state["entries"]),
-    }
-
-
-def create_state(entries: list[dict[str, Any]], summary: str) -> dict[str, Any]:
-    state = {
-        "revision": 1,
         "updated_at": now_iso(),
         "entries": entries,
-        "history": [],
     }
-    state["history"].append(snapshot_for_state(state, summary))
-    return state
 
 
 def persist_state(state: dict[str, Any]) -> None:
@@ -1043,7 +832,7 @@ def migrate_legacy_state() -> dict[str, Any]:
         for line in text.splitlines()
         if line.strip()
     ]
-    state = create_state(entries, "Imported legacy plaintext store")
+    state = create_state(entries)
     persist_state(state)
     try:
         LEGACY_TEXT_FILE.unlink()
@@ -1056,15 +845,24 @@ def load_state() -> dict[str, Any]:
     if DATA_FILE.exists():
         encrypted = DATA_FILE.read_bytes()
         try:
-          decrypted = FERNET.decrypt(encrypted)
+            decrypted = FERNET.decrypt(encrypted)
         except InvalidToken as exc:
-          raise RuntimeError("Encrypted vault could not be decrypted") from exc
-        return json.loads(decrypted.decode("utf-8"))
+            raise RuntimeError("Encrypted vault could not be decrypted") from exc
+        state = json.loads(decrypted.decode("utf-8"))
+        if "entries" not in state:
+            raise RuntimeError("Encrypted vault is missing entries")
+        if "history" in state or "revision" in state:
+            state = {
+                "updated_at": state.get("updated_at", now_iso()),
+                "entries": state["entries"],
+            }
+            persist_state(state)
+        return state
 
     if LEGACY_TEXT_FILE.exists():
         return migrate_legacy_state()
 
-    state = create_state([], "Initialized secure vault")
+    state = create_state([])
     persist_state(state)
     return state
 
@@ -1080,34 +878,20 @@ def flatten_entries(entries: list[dict[str, Any]]) -> str:
 
 
 def public_state(state: dict[str, Any]) -> dict[str, Any]:
-    history = list(reversed(state.get("history", [])))
     return {
-        "revision": state["revision"],
         "updated_at": state["updated_at"],
         "entries": copy.deepcopy(state["entries"]),
-        "history": [
-            {
-                "revision": item["revision"],
-                "updated_at": item["updated_at"],
-                "entry_count": item["entry_count"],
-                "summary": item["summary"],
-            }
-            for item in history
-        ],
     }
 
 
-def mutate_state(summary: str, mutator) -> dict[str, Any]:
+def mutate_state(mutator) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         changed = mutator(state)
         if not changed:
             return public_state(state)
 
-        state["revision"] += 1
         state["updated_at"] = now_iso()
-        state["history"].append(snapshot_for_state(state, summary))
-        state["history"] = state["history"][-HISTORY_LIMIT:]
         persist_state(state)
         return public_state(state)
 
@@ -1133,12 +917,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_unauthorized(self) -> None:
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", build_auth_header())
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
     def read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b"{}"
@@ -1149,29 +927,7 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc:
             raise ValueError("Invalid JSON body") from exc
 
-    def is_authorized(self) -> bool:
-        username, password = parse_basic_auth(self.headers.get("Authorization"))
-        if not username or not password:
-            return False
-
-        if username != SECRETS["username"]:
-            return False
-
-        return bcrypt.checkpw(
-            password.encode("utf-8"),
-            SECRETS["password_hash"].encode("utf-8"),
-        )
-
-    def require_auth(self) -> bool:
-        if self.is_authorized():
-            return True
-        self.send_unauthorized()
-        return False
-
     def do_GET(self) -> None:
-        if not self.require_auth():
-            return
-
         path = urlparse(self.path).path
 
         if path == "/raw":
@@ -1202,9 +958,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
-        if not self.require_auth():
-            return
-
         path = urlparse(self.path).path
 
         try:
@@ -1213,7 +966,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/add-text":
                 text = require_string(payload.get("text"), "text")
                 state = mutate_state(
-                    "Added text entry",
                     lambda state: state["entries"].append(
                         {
                             "id": secrets.token_hex(8),
@@ -1232,7 +984,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not src.startswith("data:image/"):
                     raise ValueError("Only inline image data URLs are accepted")
                 state = mutate_state(
-                    "Added image entry",
                     lambda state: state["entries"].append(
                         {
                             "id": secrets.token_hex(8),
@@ -1256,31 +1007,14 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                     return len(state["entries"]) != before
 
-                state = mutate_state("Deleted entry", delete_entry)
+                state = mutate_state(delete_entry)
                 self.send_json({"state": state})
                 return
 
             if path == "/api/clear":
                 state = mutate_state(
-                    "Cleared vault",
                     lambda state: bool(state["entries"]) and not state["entries"].clear(),
                 )
-                self.send_json({"state": state})
-                return
-
-            if path == "/api/restore":
-                revision = payload.get("revision")
-                if not isinstance(revision, int):
-                    raise ValueError("revision must be an integer")
-
-                def restore_revision(state: dict[str, Any]) -> bool:
-                    for snapshot in state["history"]:
-                        if snapshot["revision"] == revision:
-                            state["entries"] = copy.deepcopy(snapshot["entries"])
-                            return True
-                    raise ValueError(f"Revision {revision} was not found")
-
-                state = mutate_state(f"Restored revision {revision}", restore_revision)
                 self.send_json({"state": state})
                 return
 
