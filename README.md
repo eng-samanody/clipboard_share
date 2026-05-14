@@ -20,12 +20,14 @@ Small self-hosted clipboard sharing app for quick text snippets and images, with
 python3 clipshare_server.py
 ```
 
-The server listens on `0.0.0.0:8765` over plain HTTP.
+The server listens on `0.0.0.0:8765` over HTTPS when `clipshare_cert.pem`
+and `clipshare_key.pem` are present. It also starts a plain HTTP fallback on
+`0.0.0.0:8768`, but browser image-copy support requires the HTTPS URL.
 
 Open:
 
 ```text
-http://<your-host>:8765
+https://<your-host>:8765
 ```
 
 ## Authentication
