@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import secrets
+import ssl
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,11 +15,15 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 HOST = "0.0.0.0"
-PORT = 8765
+HTTPS_PORT = 8765
+HTTP_PORT = 8768
+ALT_HTTPS_PORT = 8767
 APP_DIR = Path(__file__).resolve().parent
 DATA_FILE = APP_DIR / "clipshare_vault.dat"
 LEGACY_TEXT_FILE = APP_DIR / "clipshare.txt"
 SECRETS_FILE = APP_DIR / "clipshare_secrets.json"
+CERT_FILE = APP_DIR / "clipshare_cert.pem"
+KEY_FILE = APP_DIR / "clipshare_key.pem"
 STATE_LOCK = threading.Lock()
 
 
@@ -404,6 +409,42 @@ HTML = """<!doctype html>
       return copied;
     }}
 
+    function legacyCopyImage(src) {{
+      const container = document.createElement("div");
+      container.contentEditable = "true";
+      container.style.position = "fixed";
+      container.style.left = "-1000px";
+      container.style.top = "0";
+      container.style.opacity = "0";
+
+      const image = document.createElement("img");
+      image.src = src;
+      image.alt = "";
+      container.appendChild(image);
+      document.body.appendChild(container);
+
+      const selection = window.getSelection();
+      let copied = false;
+
+      if (selection) {{
+        const range = document.createRange();
+        range.selectNodeContents(container);
+        selection.removeAllRanges();
+        selection.addRange(range);
+
+        try {{
+          copied = document.execCommand("copy");
+        }} catch (error) {{
+          copied = false;
+        }}
+
+        selection.removeAllRanges();
+      }}
+
+      document.body.removeChild(container);
+      return copied;
+    }}
+
     async function copyText(value, message = "Copied to clipboard") {{
       let copied = false;
 
@@ -423,14 +464,46 @@ HTML = """<!doctype html>
       setStatus(copied ? message : "Copy failed", copied ? "success" : "active");
     }}
 
+    function loadImage(src) {{
+      return new Promise((resolve, reject) => {{
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error("Could not load image"));
+        image.src = src;
+      }});
+    }}
+
+    async function imageSourceToPngBlob(src) {{
+      const image = await loadImage(src);
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth || image.width;
+      canvas.height = image.naturalHeight || image.height;
+
+      if (!canvas.width || !canvas.height) {{
+        throw new Error("Image has no dimensions");
+      }}
+
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+
+      return new Promise((resolve, reject) => {{
+        canvas.toBlob((blob) => {{
+          if (blob) {{
+            resolve(blob);
+            return;
+          }}
+
+          reject(new Error("Could not encode image"));
+        }}, "image/png");
+      }});
+    }}
+
     async function copyImage(entry) {{
       let copied = false;
       if (navigator.clipboard && window.isSecureContext && window.ClipboardItem) {{
         try {{
-          const response = await fetch(entry.src);
-          const blob = await response.blob();
           await navigator.clipboard.write([
-            new ClipboardItem({{ [blob.type || "image/png"]: blob }})
+            new ClipboardItem({{ "image/png": imageSourceToPngBlob(entry.src) }})
           ]);
           copied = true;
         }} catch (error) {{
@@ -439,7 +512,11 @@ HTML = """<!doctype html>
       }}
 
       if (!copied) {{
-        await copyText(entry.src, "Copied image data URL");
+        copied = legacyCopyImage(entry.src);
+      }}
+
+      if (!copied) {{
+        setStatus("Image copy needs HTTPS. Open the secure URL and try again.", "active");
         return;
       }}
 
@@ -1025,17 +1102,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=500)
 
 
-def build_server() -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+def build_server(port: int) -> ThreadingHTTPServer:
+    httpd = ThreadingHTTPServer((HOST, port), Handler)
+    return httpd
+
+
+def build_https_server(port: int) -> ThreadingHTTPServer | None:
+    if not CERT_FILE.exists() or not KEY_FILE.exists():
+        return None
+
+    httpd = ThreadingHTTPServer((HOST, port), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     return httpd
 
 
 def main() -> None:
     with STATE_LOCK:
         load_state()
-    httpd = build_server()
-    print(f"ClipShare listening on http://{HOST}:{PORT}")
-    httpd.serve_forever()
+    httpsd = build_https_server(HTTPS_PORT)
+
+    if not httpsd:
+        httpd = build_server(HTTP_PORT)
+        print(f"ClipShare listening on http://{HOST}:{HTTP_PORT}")
+        httpd.serve_forever()
+        return
+
+    try:
+        httpd = build_server(HTTP_PORT)
+    except OSError as exc:
+        print(f"ClipShare fallback listener unavailable on http://{HOST}:{HTTP_PORT}: {exc}")
+    else:
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"ClipShare fallback listener on http://{HOST}:{HTTP_PORT}")
+
+    try:
+        alt_httpsd = build_https_server(ALT_HTTPS_PORT)
+    except OSError as exc:
+        print(f"ClipShare alternate secure listener unavailable on https://{HOST}:{ALT_HTTPS_PORT}: {exc}")
+    else:
+        threading.Thread(target=alt_httpsd.serve_forever, daemon=True).start()
+        print(f"ClipShare alternate secure listener on https://{HOST}:{ALT_HTTPS_PORT}")
+
+    print(f"ClipShare secure listener on https://{HOST}:{HTTPS_PORT}")
+    httpsd.serve_forever()
 
 
 if __name__ == "__main__":
